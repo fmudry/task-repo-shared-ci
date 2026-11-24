@@ -122,7 +122,7 @@ check_apply_on_pipelines() {
         fi
     done <<<"$prepared_pipelines"
     rm "$run_log_file"
-    if [ -z "$updated" ]; then
+    if [ -z "$updated" ] && [ -z "$failed" ]; then
         mapfile -t pl_names < <(
             while read -r file_path; do
                 yq ".metadata.name" "$file_path"
@@ -363,6 +363,11 @@ check_oci_ta_migration() {
     local oci_migration_file
     local task_path=${migration_file#task/}
     local task_name=${task_path%%/*}
+
+    if [[ "$task_name" == *-oci-ta ]]; then
+        info "${task_name} is an OCI-TA variant itself, skipping check."
+        return 0
+    fi
 
     # Add suffix oci-ta to task name
     oci_migration_file=$(sed -E 's|task/([^/]+)(.+)|task/\1-oci-ta\2|' <<<"$migration_file")

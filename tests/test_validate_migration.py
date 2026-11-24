@@ -38,7 +38,7 @@ RUNNER = dedent("""\
     shift 3
     trap 'cp -r "$WORK_DIR/pipelines/." "$results_dir"; rm -rf "$WORK_DIR"' EXIT
     mkdir -p "$WORK_DIR/pipelines/pushed"
-    cp "$pipelines_dir"/*.yaml "$WORK_DIR/pipelines/pushed/"
+    find "$pipelines_dir" -name "*.yaml" -exec cp -t "$WORK_DIR/pipelines/pushed/" {} +
     eval "$@"
     """)
 
@@ -116,6 +116,7 @@ class TestCheckApplyOnPipelines:
         result = run_check(f"check_apply_on_pipelines {migration('exit 3')}", ["docker-build"])
         assert result.returncode == 1
         assert "failed to run migration file" in result.stderr
+        assert "does not modify any of pipelines" not in result.stderr
 
     def test_later_failures_still_stop_the_script(self, run_check, migration):
         """Showing the diff of a modified pipeline must not turn off errexit."""
@@ -125,3 +126,31 @@ class TestCheckApplyOnPipelines:
         )
         assert result.returncode == 1
         assert "still running" not in result.stdout
+
+
+class TestCheckOciTaMigration:
+
+    @pytest.fixture
+    def tasks(self, repo: Path) -> None:
+        for task in ("hello", "hello-oci-ta"):
+            (repo / "task" / task / "0.2" / "migrations").mkdir(parents=True)
+
+    def test_migration_of_the_oci_ta_variant(self, run_check, repo, tasks):
+        migration = "task/hello-oci-ta/0.2/migrations/0.3.sh"
+        (repo / migration).write_text("true\n")
+        result = run_check(f"check_oci_ta_migration {migration}", [])
+        assert result.returncode == 0, result.stderr
+        assert "oci-ta-oci-ta" not in result.stderr
+
+    def test_missing_migration_in_the_oci_ta_variant(self, run_check, repo, tasks):
+        migration = "task/hello/0.2/migrations/0.3.sh"
+        (repo / migration).write_text("true\n")
+        result = run_check(f"check_oci_ta_migration {migration}", [])
+        assert result.returncode == 1
+        assert "task/hello-oci-ta/0.2/migrations/0.3.sh" in result.stderr
+
+    def test_oci_ta_variant_has_the_migration(self, run_check, repo, tasks):
+        for task in ("hello", "hello-oci-ta"):
+            (repo / "task" / task / "0.2" / "migrations" / "0.3.sh").write_text("true\n")
+        result = run_check("check_oci_ta_migration task/hello/0.2/migrations/0.3.sh", [])
+        assert result.returncode == 0, result.stderr
