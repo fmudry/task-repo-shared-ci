@@ -23,6 +23,8 @@
 #   https://tekton.dev/docs/pipelines/install/#installation
 #
 # - Set IN_CLUSTER to true.
+#
+# The script can be sourced (e.g. by tests) to call the functions without running main.
 
 set -euo pipefail
 
@@ -454,4 +456,6 @@ main() {
     done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
