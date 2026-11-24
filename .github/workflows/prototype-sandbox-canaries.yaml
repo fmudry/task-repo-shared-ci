@@ -1,0 +1,91 @@
+# PROTOTYPE (not a templated file): check that migrations incompatible with the
+# pipeline-migration-tool sandbox are detected on GitHub-hosted runners, and record
+# what the runners allow (user namespaces, AppArmor, seccomp, crun versions).
+name: Prototype sandbox canaries
+"on":
+  pull_request:
+    branches: [main]
+  push:
+    branches: [sandbox-migration-check-prototype]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CRANE_VERSION: "0.22.1"
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  PMT_PIP_SPEC: "git+https://github.com/fmudry/pipeline-migration-tool@sandbox-ci-prototype"
+  PMT_RUNNER_IMAGE: quay.io/rh-ee-fmudry/pipeline-migration-runner:v0.9.14
+jobs:
+  canaries:
+    name: canaries (${{ matrix.os }}, crun ${{ matrix.crun.version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
+        crun:
+          # 1.30.1 is the version in the MintMaker Renovate image
+          - version: "1.30.1"
+            sha256: 86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+          - version: "1.31"
+            sha256: 8cacae171bb0e5f9e275adac2eeb2c6ec8c69fdedff7b008eadd8cdd25b0d349
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show sandbox-relevant runner environment
+        run: |
+          set -x
+          uname -r
+          grep PRETTY_NAME /etc/os-release
+          id
+          sysctl kernel.apparmor_restrict_unprivileged_userns user.max_user_namespaces || true
+          grep -E '^(Seccomp|NoNewPrivs|CapEff|CapBnd)' /proc/self/status
+          cat /proc/self/attr/current || true
+          ls -l /dev/kvm || true
+      - name: Install crun, crane and pipeline-migration-tool
+        env:
+          CRUN_VERSION: ${{ matrix.crun.version }}
+          CRUN_SHA256: ${{ matrix.crun.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/crun \
+              "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
+          echo "${CRUN_SHA256}  /tmp/crun" | sha256sum -c -
+          install -m 0755 /tmp/crun "$HOME/.local/bin/crun"
+          curl -fsSL -o /tmp/crane.tar.gz \
+              "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          tar xzf /tmp/crane.tar.gz -C "$HOME/.local/bin" crane
+
+          python3 -m venv "$HOME/pmt-venv"
+          "$HOME/pmt-venv/bin/pip" install --quiet "$PMT_PIP_SPEC"
+          echo "$HOME/pmt-venv/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "PMT_PYTHON=$HOME/pmt-venv/bin/python" >> "$GITHUB_ENV"
+      - name: Try the sandbox before relaxing anything
+        continue-on-error: true
+        run: |
+          printf 'kind: Pipeline\n' > /tmp/p.yaml
+          status=0
+          "$PMT_PYTHON" hack/run-migration-in-sandbox.py \
+              prototype/sandbox-canaries/scripts/fail-everywhere.sh /tmp/p.yaml || status=$?
+          echo "sandbox exit status without changes: $status (3 = sandbox works, 125 = sandbox unusable)"
+          [ "$status" -eq 3 ]
+      - name: Allow unprivileged user namespaces if needed
+        run: |
+          probe() {
+              unshare --user --map-root-user --mount sh -c 'mount -t tmpfs none /mnt'
+          }
+          if probe; then
+              echo "Unprivileged user namespaces work, sysctl not needed"
+          else
+              echo "::warning::Unprivileged user namespaces are restricted, relaxing kernel.apparmor_restrict_unprivileged_userns"
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe
+          fi
+          crun --version
+          crane version
+          pmt --version
+      - name: Run canaries
+        run: VERBOSE=1 prototype/sandbox-canaries/run.sh

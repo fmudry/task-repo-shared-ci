@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+# <TEMPLATED FILE!>
+# This file comes from the templates at https://github.com/konflux-ci/task-repo-shared-ci.
+# Please consider sending a PR upstream instead of editing the file directly.
+# See the SHARED-CI.md document in this repo for more details.
+
 """Run a migration script on a pipeline file inside the pipeline-migration-tool sandbox.
 
 The script runs exactly as MintMaker runs it: in a rootless crun container built from the PMT
@@ -13,11 +19,6 @@ Usage: run-migration-in-sandbox.py MIGRATION_FILE PIPELINE_FILE
 Exit status: the migration script's exit status, 1 when it left no usable pipeline file,
 124 on timeout, 125 when the sandbox itself cannot be used (not the script's fault).
 """
-
-# <TEMPLATED FILE!>
-# This file comes from the templates at https://github.com/konflux-ci/task-repo-shared-ci.
-# Please consider sending a PR upstream instead of editing the file directly.
-# See the SHARED-CI.md document in this repo for more details.
 
 import logging
 import os

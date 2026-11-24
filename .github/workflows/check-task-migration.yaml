@@ -16,9 +16,11 @@ permissions:
   contents: read
 env:
   # PROTOTYPE: apply migrations in the pipeline-migration-tool sandbox, as MintMaker does.
-  # crun matches the MintMaker Renovate image (crun 1.30.1, commit 079ff6a), crane its pinned version.
-  CRUN_VERSION: "1.30.1"
-  CRUN_SHA256: 86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+  # The MintMaker Renovate image has crun 1.30.1, but the static 1.30.1 release binary fails to start
+  # the sandbox directly on a host (statfs /proc/self/fd/N: ENOENT; seen on Fedora, kernel 7.3).
+  # crane is the version pinned in the Renovate image.
+  CRUN_VERSION: "1.31"
+  CRUN_SHA256: 8cacae171bb0e5f9e275adac2eeb2c6ec8c69fdedff7b008eadd8cdd25b0d349
   CRANE_VERSION: "0.22.1"
   CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
   PMT_PIP_SPEC: "git+https://github.com/fmudry/pipeline-migration-tool@sandbox-ci-prototype"
