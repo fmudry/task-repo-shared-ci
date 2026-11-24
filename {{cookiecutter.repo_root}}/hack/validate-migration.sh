@@ -43,6 +43,14 @@ declare -r DEFAULT_BRANCH
 : "${IN_CLUSTER:=""}"
 declare -r IN_CLUSTER
 
+# PROTOTYPE: when set, apply migrations in the pipeline-migration-tool sandbox, the way MintMaker
+# runs them, instead of directly on the host. Requires crun, crane and pipeline-migration-tool with
+# sandbox support (importable by PMT_PYTHON). PMT_RUNNER_IMAGE selects the runner image.
+: "${MIGRATION_SANDBOX:=""}"
+declare -r MIGRATION_SANDBOX
+: "${PMT_PYTHON:=python3}"
+declare -r PMT_PYTHON
+
 info() {
     echo "info: $*" >&2
 }
@@ -108,6 +116,16 @@ check_apply_on_pipelines() {
         pl_copy_file_path="${file_path}.copy"
         cp "$file_path" "$pl_copy_file_path"
         info "apply migration $migration_file to pipeline $pl_copy_file_path"
+        if [ -n "$MIGRATION_SANDBOX" ]; then
+            if ! apply_in_sandbox "$migration_file" "$file_path" "$pl_copy_file_path"; then
+                failed=true
+                rm -f "$pl_copy_file_path"
+            elif ! wrapped_diff -u "$file_path" "$pl_copy_file_path"; then
+                updated=true
+                mv "$pl_copy_file_path" "${file_path}.modified"
+            fi
+            continue
+        fi
         if ! bash -x "$migration_file" "$pl_copy_file_path" 2>"$run_log_file" >&2; then
             error "failed to run migration file $migration_file on pipeline $file_path:"
             cat "$run_log_file" >&2
@@ -135,6 +153,63 @@ check_apply_on_pipelines() {
     else
         return 0
     fi
+}
+
+# Apply a migration in the pipeline-migration-tool sandbox, as MintMaker does. The migration is
+# also run directly on the host, only to tell whether a failure is caused by the sandbox.
+# The sandbox result is authoritative: it is left in the given pipeline copy.
+# Arguments: migration file, original pipeline file, pipeline copy to migrate.
+# Exits the script when the sandbox itself cannot be used, which is not the migration's fault.
+apply_in_sandbox() {
+    local -r migration_file=$1
+    local -r original_file=$2
+    local -r pl_copy_file_path=$3
+    local -r host_copy="${pl_copy_file_path}.host"
+    local sandbox_log host_log sandbox_status=0 host_status=0
+    sandbox_log=$(mktemp --suffix=-sandbox-run)
+    host_log=$(mktemp --suffix=-host-run)
+
+    "$PMT_PYTHON" ./hack/run-migration-in-sandbox.py "$migration_file" "$pl_copy_file_path" \
+        >"$sandbox_log" 2>&1 || sandbox_status=$?
+    if [ "$sandbox_status" -eq 125 ]; then
+        error "the migration sandbox cannot be used on this machine:"
+        cat "$sandbox_log" >&2
+        exit 1
+    fi
+
+    cp "$original_file" "$host_copy"
+    bash "$migration_file" "$host_copy" >"$host_log" 2>&1 || host_status=$?
+
+    local result=0
+    if [ "$sandbox_status" -eq 0 ]; then
+        info "migration succeeded in the sandbox on pipeline $original_file"
+        if [ "$host_status" -ne 0 ]; then
+            warning "the same migration failed when run directly on the host (exit $host_status):"
+            cat "$host_log" >&2
+        elif ! cmp -s "$pl_copy_file_path" "$host_copy"; then
+            warning "the sandbox and the host produced different results for $original_file."
+            warning "The sandbox result is what MintMaker produces. Differences may also come from"
+            warning "different pipeline-migration-tool versions on the host and in the runner image."
+            wrapped_diff -u "$host_copy" "$pl_copy_file_path" >&2 || true
+        fi
+    elif [ "$host_status" -eq 0 ]; then
+        error "migration $migration_file works on the host but fails in the sandbox (exit $sandbox_status) on pipeline $original_file."
+        error "MintMaker runs migrations in this sandbox, so it would fail there too. Inside the sandbox:"
+        error "  - there is no /proc (no /proc/self/..., /dev/stdin, /dev/fd)"
+        error "  - only PATH and HOME are set, no other environment variables"
+        error "  - only the pipeline file's directory, /tmp and HOME are writable"
+        error "  - only the tools of the runner image are available (bash, pmt, yq, jq, git, python3)"
+        error "Sandbox output:"
+        cat "$sandbox_log" >&2
+        echo "::error file=${migration_file},line=1::Migration fails in the pipeline-migration-tool sandbox used by MintMaker, but works on the host. See the job log."
+        result=1
+    else
+        error "failed to run migration file $migration_file on pipeline $original_file (sandbox exit $sandbox_status, host exit $host_status):"
+        cat "$sandbox_log" >&2
+        result=1
+    fi
+    rm -f "$sandbox_log" "$host_log" "$host_copy"
+    return "$result"
 }
 
 # Run shellcheck against the given migration file without rules customization.
