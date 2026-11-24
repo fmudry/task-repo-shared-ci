@@ -58,10 +58,9 @@ warning() {
 }
 
 wrapped_diff() {
-    set +e
+    local status=0
     echo "\`\`\`diff"
-    diff "$@"
-    status=$?
+    diff "$@" || status=$?
     echo "\`\`\`"
     return $status
 }

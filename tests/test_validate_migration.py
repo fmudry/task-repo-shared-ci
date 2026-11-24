@@ -116,3 +116,12 @@ class TestCheckApplyOnPipelines:
         result = run_check(f"check_apply_on_pipelines {migration('exit 3')}", ["docker-build"])
         assert result.returncode == 1
         assert "failed to run migration file" in result.stderr
+
+    def test_later_failures_still_stop_the_script(self, run_check, migration):
+        """Showing the diff of a modified pipeline must not turn off errexit."""
+        result = run_check(
+            f"check_apply_on_pipelines {migration(MIGRATION_APPEND)}; false; echo still running",
+            ["docker-build"],
+        )
+        assert result.returncode == 1
+        assert "still running" not in result.stdout
