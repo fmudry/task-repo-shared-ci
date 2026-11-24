@@ -11,8 +11,20 @@ name: Check task migrations
     branches: [main]
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 permissions:
   contents: read
+env:
+  # PROTOTYPE: apply migrations in the pipeline-migration-tool sandbox, as MintMaker does.
+  # The MintMaker Renovate image has crun 1.30.1, but the static 1.30.1 release binary fails to start
+  # the sandbox directly on a host (statfs /proc/self/fd/N: ENOENT; seen on Fedora, kernel 7.3).
+  # crane is the version pinned in the Renovate image.
+  CRUN_VERSION: "1.31"
+  CRUN_SHA256: 8cacae171bb0e5f9e275adac2eeb2c6ec8c69fdedff7b008eadd8cdd25b0d349
+  CRANE_VERSION: "0.22.1"
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  PMT_PIP_SPEC: "git+https://github.com/fmudry/pipeline-migration-tool@sandbox-ci-prototype"
+  PMT_RUNNER_IMAGE: quay.io/rh-ee-fmudry/pipeline-migration-runner:v0.9.14
 jobs:
   check:
     runs-on: ubuntu-24.04
@@ -28,12 +40,55 @@ jobs:
       - uses: tektoncd/actions/setup-tektoncd@cd4768a594ec4a7af8ef72d73524a584cb564e34 # main
         with:
           pipeline_version: v1.18.0
+      - name: Show sandbox-relevant runner environment
+        run: |
+          set -x
+          uname -r
+          grep PRETTY_NAME /etc/os-release
+          id
+          sysctl kernel.apparmor_restrict_unprivileged_userns user.max_user_namespaces || true
+          grep -E '^(Seccomp|NoNewPrivs|CapEff|CapBnd)' /proc/self/status
+          cat /proc/self/attr/current || true
+          ls -l /dev/kvm || true
+      - name: Install crun, crane and pipeline-migration-tool
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/crun \
+              "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
+          echo "${CRUN_SHA256}  /tmp/crun" | sha256sum -c -
+          install -m 0755 /tmp/crun "$HOME/.local/bin/crun"
+          curl -fsSL -o /tmp/crane.tar.gz \
+              "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          tar xzf /tmp/crane.tar.gz -C "$HOME/.local/bin" crane
+
+          python3 -m venv "$HOME/pmt-venv"
+          "$HOME/pmt-venv/bin/pip" install --quiet "$PMT_PIP_SPEC"
+          # The same pmt runs the migrations on the host, for comparison with the sandbox
+          echo "$HOME/pmt-venv/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "PMT_PYTHON=$HOME/pmt-venv/bin/python" >> "$GITHUB_ENV"
+      - name: Allow unprivileged user namespaces if needed
+        run: |
+          probe() {
+              unshare --user --map-root-user --mount sh -c 'mount -t tmpfs none /mnt'
+          }
+          if probe; then
+              echo "Unprivileged user namespaces work, sysctl not needed"
+          else
+              echo "::warning::Unprivileged user namespaces are restricted, relaxing kernel.apparmor_restrict_unprivileged_userns"
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe
+          fi
+          crun --version
+          crane version
+          pmt --version
       - name: Run check
         run: |
           DEBIAN_FRONTEND=noninteractive \
           sudo apt-get install -y --no-install-recommends \
               tzdata python3-ruamel.yaml
-          pip install 'git+https://github.com/konflux-ci/pipeline-migration-tool@v0.9.0' --user
 
           kubectl get all -n tekton-pipelines
           # Require name main
@@ -41,4 +96,5 @@ jobs:
           # Make `git branch --show-current` works.
           git checkout -b pr-verify
           export IN_CLUSTER=1
+          export MIGRATION_SANDBOX=1
           bash ./hack/validate-migration.sh
