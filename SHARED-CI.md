@@ -269,6 +269,35 @@ To add a new task to the user pipelines, a migration can be created with a
 fictional task update. That is to select a task, bump its version
 and create a migration under the task directory.
 
+#### Migrations run in a sandbox
+
+Migration scripts are downloaded from the registry, so pipeline-migration-tool
+runs each one in a sandbox: a rootless container with only the tools that
+migrations need. Inside the sandbox, a migration script:
+
+- has no `/proc`, so `/proc/self/...`, `/dev/stdin` and `/dev/fd/...` do not
+  exist. Bash process substitution `<(...)` works.
+- sees only `PATH` and `HOME` in its environment.
+- can write only to the directory of the pipeline file, `/tmp` and `HOME`.
+- can use only `bash`, `pmt`, `yq`, `jq`, `git` and `python3`.
+- must leave the pipeline file as a regular file, not a symlink.
+- has network access.
+
+The [Check task migrations](.github/workflows/check-task-migration.yaml)
+workflow runs migrations both in the sandbox and directly on the CI machine.
+A migration that works only outside the sandbox is reported with a warning.
+
+To check a migration in the sandbox locally, install pipeline-migration-tool,
+[crun](https://github.com/containers/crun) and
+[crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane),
+then run:
+
+```bash
+pmt run-migration task/hello/migrations/0.2.sh /path/to/repo/.tekton/component-a-pull.yaml
+```
+
+Or run `hack/validate-migration.sh` with `MIGRATION_SANDBOX=enforce`.
+
 #### Create a startup migration by the helper script
 
 `./hack/create-task-migration.sh` is a convenient tool to help developers

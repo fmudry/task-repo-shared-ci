@@ -24,6 +24,12 @@
 #
 # - Set IN_CLUSTER to true.
 #
+# Run migrations in the pipeline-migration-tool sandbox, as MintMaker does:
+#
+# - Set MIGRATION_SANDBOX to warn or enforce, see below. The sandbox requires
+#   pipeline-migration-tool with the run-migration subcommand, crun, crane and
+#   unprivileged user namespaces.
+#
 # The script can be sourced (e.g. by tests) to call the functions without running main.
 
 set -euo pipefail
@@ -44,6 +50,22 @@ declare -r DEFAULT_BRANCH
 # By default, do not run with a real kubernetes cluster.
 : "${IN_CLUSTER:=""}"
 declare -r IN_CLUSTER
+
+# How migration files are run on the pipelines:
+# - off: directly on this machine.
+# - warn: in the pipeline-migration-tool sandbox and directly on this machine. A
+#   migration that works only outside the sandbox is reported with a warning,
+#   and its result outside the sandbox is used.
+# - enforce: in the pipeline-migration-tool sandbox. A migration that fails in
+#   the sandbox fails the check.
+: "${MIGRATION_SANDBOX:=off}"
+declare -r MIGRATION_SANDBOX
+
+declare -r EXIT_SANDBOX_UNUSABLE=125
+# Set once pmt is known to have the run-migration subcommand
+SANDBOX_COMMAND_CHECKED=
+# Set when the sandbox cannot be used on this machine in warn mode
+SANDBOX_UNUSABLE=
 
 info() {
     echo "info: $*" >&2
@@ -105,23 +127,46 @@ check_apply_on_pipelines() {
     local file_path=
     local updated=
     local pl_copy_file_path=
+    local status
+    local sandbox_only=
+    check_sandbox_mode
     while read -r file_path; do
         pl_copy_file_path="${file_path}.copy"
         cp "$file_path" "$pl_copy_file_path"
         info "apply migration $migration_file to pipeline $pl_copy_file_path"
-        if ! bash -x "$migration_file" "$pl_copy_file_path" 2>"$run_log_file" >&2; then
-            error "failed to run migration file $migration_file on pipeline $file_path:"
-            cat "$run_log_file" >&2
-            failed=true
-        else
-            info "diff to see if pipeline is modified by the migration"
-            if ! wrapped_diff -u "$file_path" "$pl_copy_file_path"; then
-                updated=true
-                mv "$pl_copy_file_path" "${file_path}.modified"
-            fi
+        status=0
+        apply_migration "$migration_file" "$pl_copy_file_path" "$run_log_file" || status=$?
+        case "$status" in
+            0)
+                ;;
+            2)
+                sandbox_only=true
+                if [ "$MIGRATION_SANDBOX" = enforce ]; then
+                    error "migration file $migration_file works on pipeline $file_path, but fails in the sandbox:"
+                    cat "$run_log_file" >&2
+                    failed=true
+                    continue
+                fi
+                warning "migration file $migration_file works on pipeline $file_path, but fails in the sandbox:"
+                cat "$run_log_file" >&2
+                ;;
+            *)
+                error "failed to run migration file $migration_file on pipeline $file_path:"
+                cat "$run_log_file" >&2
+                failed=true
+                continue
+                ;;
+        esac
+        info "diff to see if pipeline is modified by the migration"
+        if ! wrapped_diff -u "$file_path" "$pl_copy_file_path"; then
+            updated=true
+            mv "$pl_copy_file_path" "${file_path}.modified"
         fi
     done <<<"$prepared_pipelines"
     rm "$run_log_file"
+    if [ -n "$sandbox_only" ]; then
+        report_sandbox_only_failure "$migration_file"
+    fi
     if [ -z "$updated" ] && [ -z "$failed" ]; then
         mapfile -t pl_names < <(
             while read -r file_path; do
@@ -135,6 +180,122 @@ check_apply_on_pipelines() {
         return 1
     else
         return 0
+    fi
+}
+
+check_sandbox_mode() {
+    case "$MIGRATION_SANDBOX" in
+        off|warn|enforce)
+            ;;
+        *)
+            error "MIGRATION_SANDBOX must be off, warn or enforce, not '${MIGRATION_SANDBOX}'"
+            exit 1
+            ;;
+    esac
+}
+
+# Run a migration file on a pipeline file according to MIGRATION_SANDBOX.
+# Arguments: the migration file, the pipeline file to migrate and the file to
+# write the output to.
+# Returns 0 when the migration succeeded, 1 when it failed and 2 when it
+# fails in the sandbox but works outside of it. In the last case, the pipeline
+# file is migrated outside the sandbox in warn mode, and left untouched in
+# enforce mode.
+apply_migration() {
+    local -r migration_file=$1
+    local -r pipeline_file=$2
+    local -r log_file=$3
+    local -r host_file="${pipeline_file}.host"
+    local -r host_log_file="${log_file}.host"
+    local sandbox_status=0
+    local host_status=0
+
+    if [ "$MIGRATION_SANDBOX" != off ] && [ -z "$SANDBOX_COMMAND_CHECKED" ]; then
+        # An old or missing pmt must not be mistaken for migrations failing in the sandbox
+        SANDBOX_COMMAND_CHECKED=true
+        if ! pmt run-migration --help >"$log_file" 2>&1; then
+            echo "pipeline-migration-tool with the run-migration subcommand is required" >>"$log_file"
+            sandbox_unusable "$migration_file" "$log_file"
+        fi
+    fi
+
+    if [ "$MIGRATION_SANDBOX" = off ] || [ -n "$SANDBOX_UNUSABLE" ]; then
+        bash -x "$migration_file" "$pipeline_file" >"$log_file" 2>&1 || host_status=$?
+        return "$host_status"
+    fi
+
+    cp "$pipeline_file" "$host_file"
+    pmt run-migration "$migration_file" "$pipeline_file" >"$log_file" 2>&1 || sandbox_status=$?
+    bash -x "$migration_file" "$host_file" >"$host_log_file" 2>&1 || host_status=$?
+
+    if [ "$sandbox_status" -eq "$EXIT_SANDBOX_UNUSABLE" ]; then
+        sandbox_unusable "$migration_file" "$log_file"
+        mv "$host_file" "$pipeline_file"
+        mv "$host_log_file" "$log_file"
+        return "$host_status"
+    fi
+
+    if [ "$sandbox_status" -eq 0 ]; then
+        if [ "$host_status" -eq 0 ] && ! cmp -s "$pipeline_file" "$host_file"; then
+            warning "the migration gives a different result outside the sandbox, e.g. because of a different pipeline-migration-tool version. The result of the sandbox is used:"
+            diff -u "$host_file" "$pipeline_file" >&2 || true
+        fi
+        rm -f "$host_file" "$host_log_file"
+        return 0
+    fi
+
+    if [ "$host_status" -eq 0 ]; then
+        if [ "$MIGRATION_SANDBOX" = warn ]; then
+            mv "$host_file" "$pipeline_file"
+        fi
+        rm -f "$host_file" "$host_log_file"
+        return 2
+    fi
+
+    {
+        echo "in the sandbox:"
+        cat "$log_file"
+        echo "outside the sandbox:"
+        cat "$host_log_file"
+    } >"${log_file}.all"
+    mv "${log_file}.all" "$log_file"
+    rm -f "$host_file" "$host_log_file"
+    return 1
+}
+
+# Handle a sandbox that cannot be used on this machine: fail in enforce mode,
+# otherwise warn once and run migrations outside the sandbox from now on.
+# Arguments: the migration file and the file with the output explaining why.
+sandbox_unusable() {
+    local -r migration_file=$1
+    local -r log_file=$2
+    if [ "$MIGRATION_SANDBOX" = enforce ]; then
+        error "the migration sandbox cannot be used on this machine:"
+        cat "$log_file" >&2
+        exit 1
+    fi
+    warning "the migration sandbox cannot be used on this machine, migrations are run outside of it:"
+    cat "$log_file" >&2
+    echo "::warning file=${migration_file},line=1::The pipeline-migration-tool sandbox cannot be used on this machine, the migration was not checked in it. See the job log."
+    SANDBOX_UNUSABLE=true
+}
+
+# Explain why a migration that works outside the sandbox fails in it.
+# Arguments: the migration file.
+report_sandbox_only_failure() {
+    local -r migration_file=$1
+    local -r message="Migration works outside the sandbox, but fails in the pipeline-migration-tool sandbox that migrations are applied in. See the job log."
+    info "In the sandbox, a migration script:"
+    info "  - has no /proc, so /proc/self/..., /dev/stdin and /dev/fd/... do not exist"
+    info "  - sees only PATH and HOME in its environment"
+    info "  - can write only to the directory of the pipeline file, /tmp and HOME"
+    info "  - can use only bash, pmt, yq, jq, git and python3"
+    info "  - must leave the pipeline file as a regular file, not a symlink"
+    info "See https://github.com/konflux-ci/pipeline-migration-tool#migration-script-sandbox"
+    if [ "$MIGRATION_SANDBOX" = enforce ]; then
+        echo "::error file=${migration_file},line=1::${message}"
+    else
+        echo "::warning file=${migration_file},line=1::${message}"
     fi
 }
 
@@ -412,6 +573,8 @@ check_migrations_use_only_pmt() {
 }
 
 main() {
+    check_sandbox_mode
+
     if git status --porcelain | grep -qv "^??"; then
         info "There are uncommitted changes. Please commit them and run again."
         exit 1
